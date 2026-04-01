@@ -7,6 +7,31 @@ use crossterm::queue;
 use crossterm::terminal::{self, Clear, ClearType};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlashCommandDescriptor {
+    pub command: String,
+    pub description: Option<String>,
+    pub argument_hint: Option<String>,
+    pub aliases: Vec<String>,
+}
+
+impl SlashCommandDescriptor {
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn simple(command: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+            description: None,
+            argument_hint: None,
+            aliases: Vec::new(),
+        }
+    }
+
+    fn triggers(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.command.as_str()).chain(self.aliases.iter().map(String::as_str))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadOutcome {
     Submit(String),
     Cancel,
@@ -178,14 +203,21 @@ impl EditSession {
         out: &mut impl Write,
         base_prompt: &str,
         vim_enabled: bool,
+        assist_lines: &[String],
     ) -> io::Result<()> {
         self.clear_render(out)?;
 
         let prompt = self.prompt(base_prompt, vim_enabled);
         let buffer = self.visible_buffer();
         write!(out, "{prompt}{buffer}")?;
+        if !assist_lines.is_empty() {
+            for line in assist_lines {
+                write!(out, "\r\n{line}")?;
+            }
+        }
 
-        let (cursor_row, cursor_col, total_lines) = self.cursor_layout(prompt.as_ref());
+        let (cursor_row, cursor_col, total_lines) =
+            self.cursor_layout(prompt.as_ref(), assist_lines.len());
         let rows_to_move_up = total_lines.saturating_sub(cursor_row + 1);
         if rows_to_move_up > 0 {
             queue!(out, MoveUp(to_u16(rows_to_move_up)?))?;
@@ -211,7 +243,7 @@ impl EditSession {
         writeln!(out)
     }
 
-    fn cursor_layout(&self, prompt: &str) -> (usize, usize, usize) {
+    fn cursor_layout(&self, prompt: &str, assist_line_count: usize) -> (usize, usize, usize) {
         let active_text = self.active_text();
         let cursor = if self.mode == EditorMode::Command {
             self.command_cursor
@@ -225,7 +257,8 @@ impl EditSession {
             Some((_, suffix)) => suffix.chars().count(),
             None => prompt.chars().count() + cursor_prefix.chars().count(),
         };
-        let total_lines = active_text.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        let total_lines =
+            active_text.bytes().filter(|byte| *byte == b'\n').count() + 1 + assist_line_count;
         (cursor_row, cursor_col, total_lines)
     }
 }
@@ -240,7 +273,7 @@ enum KeyAction {
 
 pub struct LineEditor {
     prompt: String,
-    completions: Vec<String>,
+    slash_commands: Vec<SlashCommandDescriptor>,
     history: Vec<String>,
     yank_buffer: YankBuffer,
     vim_enabled: bool,
@@ -255,11 +288,24 @@ struct CompletionState {
 }
 
 impl LineEditor {
+    #[allow(dead_code)]
     #[must_use]
     pub fn new(prompt: impl Into<String>, completions: Vec<String>) -> Self {
+        let slash_commands = completions
+            .into_iter()
+            .map(SlashCommandDescriptor::simple)
+            .collect();
+        Self::with_slash_commands(prompt, slash_commands)
+    }
+
+    #[must_use]
+    pub fn with_slash_commands(
+        prompt: impl Into<String>,
+        slash_commands: Vec<SlashCommandDescriptor>,
+    ) -> Self {
         Self {
             prompt: prompt.into(),
-            completions,
+            slash_commands,
             history: Vec::new(),
             yank_buffer: YankBuffer::default(),
             vim_enabled: false,
@@ -284,7 +330,12 @@ impl LineEditor {
         let _raw_mode = RawModeGuard::new()?;
         let mut stdout = io::stdout();
         let mut session = EditSession::new(self.vim_enabled);
-        session.render(&mut stdout, &self.prompt, self.vim_enabled)?;
+        session.render(
+            &mut stdout,
+            &self.prompt,
+            self.vim_enabled,
+            &self.command_assist_lines(&session),
+        )?;
 
         loop {
             let Event::Key(key) = event::read()? else {
@@ -296,7 +347,12 @@ impl LineEditor {
 
             match self.handle_key_event(&mut session, key) {
                 KeyAction::Continue => {
-                    session.render(&mut stdout, &self.prompt, self.vim_enabled)?;
+                    session.render(
+                        &mut stdout,
+                        &self.prompt,
+                        self.vim_enabled,
+                        &self.command_assist_lines(&session),
+                    )?;
                 }
                 KeyAction::Submit(line) => {
                     session.finalize_render(&mut stdout, &self.prompt, self.vim_enabled)?;
@@ -325,7 +381,12 @@ impl LineEditor {
                         }
                     )?;
                     session = EditSession::new(self.vim_enabled);
-                    session.render(&mut stdout, &self.prompt, self.vim_enabled)?;
+                    session.render(
+                        &mut stdout,
+                        &self.prompt,
+                        self.vim_enabled,
+                        &self.command_assist_lines(&session),
+                    )?;
                 }
             }
         }
@@ -699,25 +760,21 @@ impl LineEditor {
                 state
                     .matches
                     .iter()
-                    .any(|candidate| candidate == &session.text)
+                    .any(|candidate| session.text == *candidate || session.text == format!("{candidate} "))
             })
         {
             let candidate = state.matches[state.next_index % state.matches.len()].clone();
             state.next_index += 1;
-            session.text.replace_range(..session.cursor, &candidate);
-            session.cursor = candidate.len();
+            let replacement = completed_command(&candidate);
+            session.text.replace_range(..session.cursor, &replacement);
+            session.cursor = replacement.len();
             return;
         }
         let Some(prefix) = slash_command_prefix(&session.text, session.cursor) else {
             self.completion_state = None;
             return;
         };
-        let matches = self
-            .completions
-            .iter()
-            .filter(|candidate| candidate.starts_with(prefix) && candidate.as_str() != prefix)
-            .cloned()
-            .collect::<Vec<_>>();
+        let matches = self.matching_commands(prefix);
         if matches.is_empty() {
             self.completion_state = None;
             return;
@@ -741,8 +798,111 @@ impl LineEditor {
             candidate
         };
 
-        session.text.replace_range(..session.cursor, &candidate);
-        session.cursor = candidate.len();
+        let replacement = completed_command(&candidate);
+        session.text.replace_range(..session.cursor, &replacement);
+        session.cursor = replacement.len();
+    }
+
+    fn matching_commands(&self, prefix: &str) -> Vec<String> {
+        let normalized = prefix.to_ascii_lowercase();
+        let mut ranked = self
+            .slash_commands
+            .iter()
+            .filter_map(|descriptor| {
+                let command = descriptor.command.clone();
+                let mut best_rank = None::<(u8, usize)>;
+                for trigger in descriptor.triggers() {
+                    let trigger_lower = trigger.to_ascii_lowercase();
+                    let rank = if trigger_lower == normalized {
+                        if trigger == descriptor.command {
+                            Some((0, trigger.len()))
+                        } else {
+                            Some((1, trigger.len()))
+                        }
+                    } else if trigger_lower.starts_with(&normalized) {
+                        if trigger == descriptor.command {
+                            Some((2, trigger.len()))
+                        } else {
+                            Some((3, trigger.len()))
+                        }
+                    } else if trigger_lower.contains(&normalized) {
+                        Some((4, trigger.len()))
+                    } else {
+                        None
+                    };
+                    if let Some(rank) = rank {
+                        best_rank = Some(best_rank.map_or(rank, |current| current.min(rank)));
+                    }
+                }
+                best_rank.map(|(bucket, len)| (bucket, len, command))
+            })
+            .collect::<Vec<_>>();
+
+        ranked.sort_by(|left, right| left.cmp(right));
+        ranked.dedup_by(|left, right| left.2 == right.2);
+        ranked.into_iter().map(|(_, _, command)| command).collect()
+    }
+
+    fn command_assist_lines(&self, session: &EditSession) -> Vec<String> {
+        if session.mode == EditorMode::Command || session.cursor != session.text.len() {
+            return Vec::new();
+        }
+
+        let input = session.text.as_str();
+        if !input.starts_with('/') {
+            return Vec::new();
+        }
+
+        if let Some((command, args)) = command_and_args(input) {
+            if input.ends_with(' ') && args.is_empty() {
+                if let Some(descriptor) = self.find_command_descriptor(command) {
+                    let mut lines = Vec::new();
+                    if let Some(argument_hint) = &descriptor.argument_hint {
+                        lines.push(dimmed_line(format!("Arguments: {argument_hint}")));
+                    }
+                    if let Some(description) = &descriptor.description {
+                        lines.push(dimmed_line(description));
+                    }
+                    if !lines.is_empty() {
+                        return lines;
+                    }
+                }
+            }
+        }
+
+        if input.contains(char::is_whitespace) {
+            return Vec::new();
+        }
+
+        let matches = self.matching_commands(input);
+        if matches.is_empty() {
+            return Vec::new();
+        }
+
+        let mut lines = vec![dimmed_line("Suggestions")];
+        lines.extend(matches.into_iter().take(3).map(|command| {
+            let description = self
+                .find_command_descriptor(command.trim_start_matches('/'))
+                .and_then(|descriptor| descriptor.description.as_deref())
+                .unwrap_or_default();
+            if description.is_empty() {
+                dimmed_line(format!("  {command}"))
+            } else {
+                dimmed_line(format!("  {command:<18} {description}"))
+            }
+        }));
+        lines
+    }
+
+    fn find_command_descriptor(&self, name: &str) -> Option<&SlashCommandDescriptor> {
+        let normalized = name.trim().trim_start_matches('/').to_ascii_lowercase();
+        self.slash_commands.iter().find(|descriptor| {
+            descriptor.command.trim_start_matches('/').eq_ignore_ascii_case(&normalized)
+                || descriptor
+                    .aliases
+                    .iter()
+                    .any(|alias| alias.trim_start_matches('/').eq_ignore_ascii_case(&normalized))
+        })
     }
 
     fn history_up(&self, session: &mut EditSession) {
@@ -964,6 +1124,27 @@ fn slash_command_prefix(line: &str, pos: usize) -> Option<&str> {
     Some(prefix)
 }
 
+fn command_and_args(input: &str) -> Option<(&str, &str)> {
+    let trimmed = input.trim_start();
+    let without_slash = trimmed.strip_prefix('/')?;
+    let (command, args) = without_slash
+        .split_once(' ')
+        .map_or((without_slash, ""), |(command, args)| (command, args));
+    Some((command, args))
+}
+
+fn completed_command(command: &str) -> String {
+    if command.ends_with(' ') {
+        command.to_string()
+    } else {
+        format!("{command} ")
+    }
+}
+
+fn dimmed_line(text: impl AsRef<str>) -> String {
+    format!("\x1b[2m{}\x1b[0m", text.as_ref())
+}
+
 fn to_u16(value: usize) -> io::Result<u16> {
     u16::try_from(value).map_err(|_| {
         io::Error::new(
@@ -977,6 +1158,7 @@ fn to_u16(value: usize) -> io::Result<u16> {
 mod tests {
     use super::{
         selection_bounds, slash_command_prefix, EditSession, EditorMode, KeyAction, LineEditor,
+        SlashCommandDescriptor,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -1148,8 +1330,8 @@ mod tests {
         editor.complete_slash_command(&mut session);
 
         // then
-        assert_eq!(session.text, "/help");
-        assert_eq!(session.cursor, 5);
+        assert_eq!(session.text, "/help ");
+        assert_eq!(session.cursor, 6);
     }
 
     #[test]
@@ -1171,8 +1353,65 @@ mod tests {
         let second = session.text.clone();
 
         // then
-        assert_eq!(first, "/permissions");
-        assert_eq!(second, "/plugin");
+        assert_eq!(first, "/plugin ");
+        assert_eq!(second, "/permissions ");
+    }
+
+    #[test]
+    fn tab_completion_prefers_canonical_command_over_alias() {
+        let mut editor = LineEditor::with_slash_commands(
+            "> ",
+            vec![SlashCommandDescriptor {
+                command: "/plugin".to_string(),
+                description: Some("Manage plugins".to_string()),
+                argument_hint: Some("[list]".to_string()),
+                aliases: vec!["/plugins".to_string(), "/marketplace".to_string()],
+            }],
+        );
+        let mut session = EditSession::new(false);
+        session.text = "/plugins".to_string();
+        session.cursor = session.text.len();
+
+        editor.complete_slash_command(&mut session);
+
+        assert_eq!(session.text, "/plugin ");
+    }
+
+    #[test]
+    fn command_assist_lines_show_suggestions_and_argument_hints() {
+        let editor = LineEditor::with_slash_commands(
+            "> ",
+            vec![
+                SlashCommandDescriptor {
+                    command: "/help".to_string(),
+                    description: Some("Show help and available commands".to_string()),
+                    argument_hint: None,
+                    aliases: Vec::new(),
+                },
+                SlashCommandDescriptor {
+                    command: "/model".to_string(),
+                    description: Some("Show or switch the active model".to_string()),
+                    argument_hint: Some("[model]".to_string()),
+                    aliases: Vec::new(),
+                },
+            ],
+        );
+
+        let mut prefix_session = EditSession::new(false);
+        prefix_session.text = "/h".to_string();
+        prefix_session.cursor = prefix_session.text.len();
+        let prefix_lines = editor.command_assist_lines(&prefix_session);
+        assert!(prefix_lines.iter().any(|line| line.contains("Suggestions")));
+        assert!(prefix_lines.iter().any(|line| line.contains("/help")));
+
+        let mut hint_session = EditSession::new(false);
+        hint_session.text = "/model ".to_string();
+        hint_session.cursor = hint_session.text.len();
+        let hint_lines = editor.command_assist_lines(&hint_session);
+        assert!(hint_lines.iter().any(|line| line.contains("Arguments: [model]")));
+        assert!(hint_lines
+            .iter()
+            .any(|line| line.contains("Show or switch the active model")));
     }
 
     #[test]

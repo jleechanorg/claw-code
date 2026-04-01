@@ -28,6 +28,7 @@ use commands::{
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
+use input::SlashCommandDescriptor;
 use plugins::{PluginManager, PluginManagerConfig};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
@@ -1009,7 +1010,7 @@ fn run_repl(
     permission_mode: PermissionMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
-    let mut editor = input::LineEditor::new("> ", slash_command_completion_candidates());
+    let mut editor = input::LineEditor::with_slash_commands("> ", slash_command_descriptors());
     println!("{}", cli.startup_banner());
 
     loop {
@@ -1141,13 +1142,14 @@ impl LiveCli {
             format!(
                 "  Quick start      {}",
                 if has_claw_md {
-                    "/help · /status · ask for a task"
+                    "Type / to browse commands · /help for shortcuts · ask for a task"
                 } else {
-                    "/init · /help · /status"
+                    "/init · then type / to browse commands"
                 }
             ),
-            "  Editor           Tab completes slash commands · /vim toggles modal editing"
+            "  Autocomplete     Type / for command suggestions · Tab accepts or cycles"
                 .to_string(),
+            "  Editor           /vim toggles modal editing · Esc clears menus first".to_string(),
             "  Multiline        Shift+Enter or Ctrl+J inserts a newline".to_string(),
         ];
         if !has_claw_md {
@@ -1973,14 +1975,15 @@ fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::e
 fn render_repl_help() -> String {
     [
         "Interactive REPL".to_string(),
-        "  Quick start          Ask a task in plain English or use one of the core commands below."
+        "  Quick start          Ask a task in plain English, or type / to browse slash commands."
             .to_string(),
         "  Core commands        /help · /status · /model · /permissions · /compact".to_string(),
         "  Exit                 /exit or /quit".to_string(),
+        "  Autocomplete         Type / for suggestions · Tab accepts or cycles matches".to_string(),
         "  Vim mode             /vim toggles modal editing".to_string(),
         "  History              Up/Down recalls previous prompts".to_string(),
-        "  Completion           Tab cycles slash command matches".to_string(),
-        "  Cancel               Ctrl-C clears input (or exits on an empty prompt)".to_string(),
+        "  Cancel               Esc dismisses menus first · Ctrl-C clears input (or exits on empty)"
+            .to_string(),
         "  Multiline            Shift+Enter or Ctrl+J inserts a newline".to_string(),
         String::new(),
         render_slash_command_help(),
@@ -3283,21 +3286,44 @@ fn collect_tool_results(summary: &runtime::TurnSummary) -> Vec<serde_json::Value
         .collect()
 }
 
-fn slash_command_completion_candidates() -> Vec<String> {
-    let mut candidates = slash_command_specs()
+fn slash_command_descriptors() -> Vec<SlashCommandDescriptor> {
+    let mut descriptors = slash_command_specs()
         .iter()
-        .flat_map(|spec| {
-            std::iter::once(spec.name)
-                .chain(spec.aliases.iter().copied())
-                .map(|name| format!("/{name}"))
+        .map(|spec| SlashCommandDescriptor {
+            command: format!("/{}", spec.name),
+            description: Some(spec.summary.to_string()),
+            argument_hint: spec.argument_hint.map(ToOwned::to_owned),
+            aliases: spec.aliases.iter().map(|alias| format!("/{alias}")).collect(),
+        })
+        .collect::<Vec<_>>();
+    descriptors.extend([
+        SlashCommandDescriptor {
+            command: "/vim".to_string(),
+            description: Some("Toggle modal editing".to_string()),
+            argument_hint: None,
+            aliases: Vec::new(),
+        },
+        SlashCommandDescriptor {
+            command: "/exit".to_string(),
+            description: Some("Exit the interactive REPL".to_string()),
+            argument_hint: None,
+            aliases: vec!["/quit".to_string()],
+        },
+    ]);
+    descriptors.sort_by(|left, right| left.command.cmp(&right.command));
+    descriptors.dedup_by(|left, right| left.command == right.command);
+    descriptors
+}
+
+fn slash_command_completion_candidates() -> Vec<String> {
+    let mut candidates = slash_command_descriptors()
+        .into_iter()
+        .flat_map(|descriptor| {
+            std::iter::once(descriptor.command)
+                .chain(descriptor.aliases)
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    candidates.extend([
-        String::from("/vim"),
-        String::from("/exit"),
-        String::from("/quit"),
-    ]);
     candidates.sort();
     candidates.dedup();
     candidates
@@ -3988,6 +4014,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
+        "  /                                     Open slash suggestions in the REPL"
+    )?;
+    writeln!(
+        out,
         "  /status                               Inspect session + workspace state"
     )?;
     writeln!(
@@ -4000,7 +4030,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  Tab                                   Complete slash commands"
+        "  Tab                                   Accept or cycle slash command suggestions"
     )?;
     writeln!(
         out,
@@ -4115,7 +4145,8 @@ mod tests {
         normalize_permission_mode, parse_args, parse_git_status_metadata, permission_policy,
         print_help_to, push_output_block, render_config_report, render_memory_report,
         render_repl_help, render_unknown_repl_command, resolve_model_alias, response_to_events,
-        resume_supported_slash_commands, slash_command_completion_candidates, status_context,
+        resume_supported_slash_commands, slash_command_completion_candidates,
+        slash_command_descriptors, status_context,
         CliAction, CliOutputFormat, InternalPromptProgressEvent, InternalPromptProgressState,
         SlashCommand, StatusUsage, DEFAULT_MODEL,
     };
@@ -4439,6 +4470,7 @@ mod tests {
     fn repl_help_includes_shared_commands_and_exit() {
         let help = render_repl_help();
         assert!(help.contains("Interactive REPL"));
+        assert!(help.contains("type / to browse slash commands"));
         assert!(help.contains("/help"));
         assert!(help.contains("/status"));
         assert!(help.contains("/model [model]"));
@@ -4460,7 +4492,8 @@ mod tests {
         assert!(help.contains("/agents"));
         assert!(help.contains("/skills"));
         assert!(help.contains("/exit"));
-        assert!(help.contains("Tab cycles slash command matches"));
+        assert!(help.contains("Type / for suggestions"));
+        assert!(help.contains("Tab accepts or cycles matches"));
     }
 
     #[test]
@@ -4470,6 +4503,27 @@ mod tests {
         assert!(candidates.contains(&"/vim".to_string()));
         assert!(candidates.contains(&"/exit".to_string()));
         assert!(candidates.contains(&"/quit".to_string()));
+    }
+
+    #[test]
+    fn slash_command_descriptors_include_descriptions_and_aliases() {
+        let descriptors = slash_command_descriptors();
+        let plugin = descriptors
+            .iter()
+            .find(|descriptor| descriptor.command == "/plugin")
+            .expect("plugin descriptor should exist");
+        assert_eq!(
+            plugin.description.as_deref(),
+            Some("Manage Claw Code plugins")
+        );
+        assert!(plugin.aliases.contains(&"/plugins".to_string()));
+        assert!(plugin.aliases.contains(&"/marketplace".to_string()));
+
+        let exit = descriptors
+            .iter()
+            .find(|descriptor| descriptor.command == "/exit")
+            .expect("exit descriptor should exist");
+        assert!(exit.aliases.contains(&"/quit".to_string()));
     }
 
     #[test]
@@ -4559,6 +4613,7 @@ mod tests {
         print_help_to(&mut help).expect("help should render");
         let help = String::from_utf8(help).expect("help should be utf8");
         assert!(help.contains("claw init"));
+        assert!(help.contains("Open slash suggestions in the REPL"));
         assert!(help.contains("claw agents"));
         assert!(help.contains("claw skills"));
         assert!(help.contains("claw /skills"));
@@ -4762,7 +4817,7 @@ mod tests {
     fn repl_help_mentions_history_completion_and_multiline() {
         let help = render_repl_help();
         assert!(help.contains("Up/Down"));
-        assert!(help.contains("Tab cycles"));
+        assert!(help.contains("Tab accepts or cycles"));
         assert!(help.contains("Shift+Enter or Ctrl+J"));
     }
 

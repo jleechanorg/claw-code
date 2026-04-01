@@ -27,7 +27,7 @@ use runtime::{
     AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
     ConversationMessage, ConversationRuntime, MessageRole, OAuthAuthorizationRequest,
     OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, RuntimeError,
-    Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    Session, SessionMetadata, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde_json::json;
 use tools::{execute_tool, mvp_tool_specs, ToolSpec};
@@ -37,6 +37,7 @@ const DEFAULT_MAX_TOKENS: u32 = 32;
 const DEFAULT_DATE: &str = "2026-03-31";
 const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const OLD_SESSION_COMPACTION_AGE_SECS: u64 = 60 * 60 * 24;
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
 
@@ -70,8 +71,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
             allowed_tools,
             permission_mode,
-            color,
-        } => LiveCli::new(model, false, allowed_tools, permission_mode, color)?
+        } => LiveCli::new(model, false, allowed_tools, permission_mode)?
             .run_turn_with_output(&prompt, output_format)?,
         CliAction::Login => run_login()?,
         CliAction::Logout => run_logout()?,
@@ -79,8 +79,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             model,
             allowed_tools,
             permission_mode,
-            color,
-        } => run_repl(model, allowed_tools, permission_mode, color)?,
+        } => run_repl(model, allowed_tools, permission_mode)?,
         CliAction::Help => print_help(),
     }
     Ok(())
@@ -105,7 +104,6 @@ enum CliAction {
         output_format: CliOutputFormat,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
-        color: bool,
     },
     Login,
     Logout,
@@ -113,7 +111,6 @@ enum CliAction {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
-        color: bool,
     },
     // prompt-mode formatting is only supported for non-interactive runs
     Help,
@@ -144,7 +141,6 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut permission_mode = default_permission_mode();
     let mut wants_version = false;
     let mut allowed_tool_values = Vec::new();
-    let mut color = true;
     let mut rest = Vec::new();
     let mut index = 0;
 
@@ -152,10 +148,6 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         match args[index].as_str() {
             "--version" | "-V" => {
                 wants_version = true;
-                index += 1;
-            }
-            "--no-color" => {
-                color = false;
                 index += 1;
             }
             "--model" => {
@@ -224,7 +216,6 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             model,
             allowed_tools,
             permission_mode,
-            color,
         });
     }
     if matches!(rest.first().map(String::as_str), Some("--help" | "-h")) {
@@ -251,7 +242,6 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 output_format,
                 allowed_tools,
                 permission_mode,
-                color,
             })
         }
         other if !other.starts_with('/') => Ok(CliAction::Prompt {
@@ -260,7 +250,6 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             output_format,
             allowed_tools,
             permission_mode,
-            color,
         }),
         other => Err(format!("unknown subcommand: {other}")),
     }
@@ -547,7 +536,14 @@ fn print_version() {
 }
 
 fn resume_session(session_path: &Path, commands: &[String]) {
-    let session = match Session::load_from_path(session_path) {
+    let handle = match resolve_session_reference(&session_path.display().to_string()) {
+        Ok(handle) => handle,
+        Err(error) => {
+            eprintln!("failed to resolve session: {error}");
+            std::process::exit(1);
+        }
+    };
+    let session = match Session::load_from_path(&handle.path) {
         Ok(session) => session,
         Err(error) => {
             eprintln!("failed to restore session: {error}");
@@ -558,7 +554,7 @@ fn resume_session(session_path: &Path, commands: &[String]) {
     if commands.is_empty() {
         println!(
             "Restored session from {} ({} messages).",
-            session_path.display(),
+            handle.path.display(),
             session.messages.len()
         );
         return;
@@ -570,7 +566,7 @@ fn resume_session(session_path: &Path, commands: &[String]) {
             eprintln!("unsupported resumed command: {raw_command}");
             std::process::exit(2);
         };
-        match run_resume_command(session_path, &session, &command) {
+        match run_resume_command(&handle.path, &session, &command) {
             Ok(ResumeCommandOutcome {
                 session: next_session,
                 message,
@@ -895,6 +891,7 @@ fn run_resume_command(
         | SlashCommand::Model { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Session { .. }
+        | SlashCommand::Sessions
         | SlashCommand::Unknown(_) => Err("unsupported resumed slash command".into()),
     }
 }
@@ -903,9 +900,8 @@ fn run_repl(
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
-    color: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode, color)?;
+    let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
     let mut editor = input::LineEditor::new("› ", slash_command_completion_candidates());
     println!("{}", cli.startup_banner());
 
@@ -952,17 +948,18 @@ struct ManagedSessionSummary {
     path: PathBuf,
     modified_epoch_secs: u64,
     message_count: usize,
+    model: Option<String>,
+    started_at: Option<String>,
+    last_prompt: Option<String>,
 }
 
 struct LiveCli {
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
-    color: bool,
     system_prompt: Vec<String>,
     runtime: ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
     session: SessionHandle,
-    renderer: TerminalRenderer,
 }
 
 impl LiveCli {
@@ -971,10 +968,10 @@ impl LiveCli {
         enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
-        color: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
         let session = create_managed_session_handle()?;
+        auto_compact_inactive_sessions(&session.id)?;
         let runtime = build_runtime(
             Session::new(),
             model.clone(),
@@ -982,17 +979,14 @@ impl LiveCli {
             enable_tools,
             allowed_tools.clone(),
             permission_mode,
-            color,
         )?;
         let cli = Self {
             model,
             allowed_tools,
             permission_mode,
-            color,
             system_prompt,
             runtime,
             session,
-            renderer: TerminalRenderer::with_color(color),
         };
         cli.persist_session()?;
         Ok(cli)
@@ -1016,33 +1010,26 @@ impl LiveCli {
         let mut stdout = io::stdout();
         spinner.tick(
             "Waiting for Claude",
-            self.renderer.color_theme(),
+            TerminalRenderer::new().color_theme(),
             &mut stdout,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = self.runtime.run_turn(input, Some(&mut permission_prompter));
         match result {
-            Ok(summary) => {
+            Ok(_) => {
                 spinner.finish(
                     "Claude response complete",
-                    self.renderer.color_theme(),
+                    TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
                 println!();
-                println!(
-                    "{}",
-                    self.renderer.token_usage_summary(
-                        u64::from(summary.usage.input_tokens),
-                        u64::from(summary.usage.output_tokens)
-                    )
-                );
                 self.persist_session()?;
                 Ok(())
             }
             Err(error) => {
                 spinner.fail(
                     "Claude request failed",
-                    self.renderer.color_theme(),
+                    TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
                 Err(Box::new(error))
@@ -1156,6 +1143,10 @@ impl LiveCli {
             SlashCommand::Session { action, target } => {
                 self.handle_session_command(action.as_deref(), target.as_deref())?
             }
+            SlashCommand::Sessions => {
+                println!("{}", render_session_list(&self.session.id)?);
+                false
+            }
             SlashCommand::Unknown(name) => {
                 eprintln!("unknown slash command: /{name}");
                 false
@@ -1164,7 +1155,10 @@ impl LiveCli {
     }
 
     fn persist_session(&self) -> Result<(), Box<dyn std::error::Error>> {
-        self.runtime.session().save_to_path(&self.session.path)?;
+        let mut session = self.runtime.session().clone();
+        session.metadata = Some(derive_session_metadata(&session, &self.model));
+        session.save_to_path(&self.session.path)?;
+        auto_compact_inactive_sessions(&self.session.id)?;
         Ok(())
     }
 
@@ -1223,7 +1217,6 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
-            self.color,
         )?;
         self.model.clone_from(&model);
         println!(
@@ -1266,7 +1259,6 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
-            self.color,
         )?;
         println!(
             "{}",
@@ -1291,7 +1283,6 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
-            self.color,
         )?;
         println!(
             "Session cleared\n  Mode             fresh session\n  Preserved model  {}\n  Permission mode  {}\n  Session          {}",
@@ -1312,13 +1303,20 @@ impl LiveCli {
         session_path: Option<String>,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let Some(session_ref) = session_path else {
-            println!("Usage: /resume <session-path>");
+            println!("Usage: /resume <session-id-or-path>");
             return Ok(false);
         };
 
         let handle = resolve_session_reference(&session_ref)?;
         let session = Session::load_from_path(&handle.path)?;
         let message_count = session.messages.len();
+        if let Some(model) = session
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.model.clone())
+        {
+            self.model = model;
+        }
         self.runtime = build_runtime(
             session,
             self.model.clone(),
@@ -1326,7 +1324,6 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
-            self.color,
         )?;
         self.session = handle;
         println!(
@@ -1396,6 +1393,13 @@ impl LiveCli {
                 let handle = resolve_session_reference(target)?;
                 let session = Session::load_from_path(&handle.path)?;
                 let message_count = session.messages.len();
+                if let Some(model) = session
+                    .metadata
+                    .as_ref()
+                    .map(|metadata| metadata.model.clone())
+                {
+                    self.model = model;
+                }
                 self.runtime = build_runtime(
                     session,
                     self.model.clone(),
@@ -1403,7 +1407,6 @@ impl LiveCli {
                     true,
                     self.allowed_tools.clone(),
                     self.permission_mode,
-                    self.color,
                 )?;
                 self.session = handle;
                 println!(
@@ -1433,7 +1436,6 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
-            self.color,
         )?;
         self.persist_session()?;
         println!("{}", format_compact_report(removed, kept, skipped));
@@ -1442,8 +1444,10 @@ impl LiveCli {
 }
 
 fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let cwd = env::current_dir()?;
-    let path = cwd.join(".claude").join("sessions");
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+    let path = home.join(".claude").join("sessions");
     fs::create_dir_all(&path)?;
     Ok(path)
 }
@@ -1464,8 +1468,19 @@ fn generate_session_id() -> String {
 
 fn resolve_session_reference(reference: &str) -> Result<SessionHandle, Box<dyn std::error::Error>> {
     let direct = PathBuf::from(reference);
+    let expanded = if let Some(stripped) = reference.strip_prefix("~/") {
+        sessions_dir()?
+            .parent()
+            .and_then(|claude| claude.parent())
+            .map(|home| home.join(stripped))
+            .unwrap_or(direct.clone())
+    } else {
+        direct.clone()
+    };
     let path = if direct.exists() {
         direct
+    } else if expanded.exists() {
+        expanded
     } else {
         sessions_dir()?.join(format!("{reference}.json"))
     };
@@ -1495,9 +1510,11 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_secs())
             .unwrap_or_default();
-        let message_count = Session::load_from_path(&path)
-            .map(|session| session.messages.len())
-            .unwrap_or_default();
+        let session = Session::load_from_path(&path).ok();
+        let derived_message_count = session.as_ref().map_or(0, |session| session.messages.len());
+        let stored = session
+            .as_ref()
+            .and_then(|session| session.metadata.as_ref());
         let id = path
             .file_stem()
             .and_then(|value| value.to_str())
@@ -1507,7 +1524,12 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
             id,
             path,
             modified_epoch_secs,
-            message_count,
+            message_count: stored.map_or(derived_message_count, |metadata| {
+                metadata.message_count as usize
+            }),
+            model: stored.map(|metadata| metadata.model.clone()),
+            started_at: stored.map(|metadata| metadata.started_at.clone()),
+            last_prompt: stored.and_then(|metadata| metadata.last_prompt.clone()),
         });
     }
     sessions.sort_by(|left, right| right.modified_epoch_secs.cmp(&left.modified_epoch_secs));
@@ -1530,15 +1552,97 @@ fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::e
         } else {
             "○ saved"
         };
+        let model = session.model.as_deref().unwrap_or("unknown");
+        let started = session.started_at.as_deref().unwrap_or("unknown");
+        let last_prompt = session.last_prompt.as_deref().map_or_else(
+            || "-".to_string(),
+            |prompt| truncate_for_summary(prompt, 36),
+        );
         lines.push(format!(
-            "  {id:<20} {marker:<10} msgs={msgs:<4} modified={modified} path={path}",
+            "  {id:<20} {marker:<10} msgs={msgs:<4} model={model:<24} started={started} modified={modified} last={last_prompt} path={path}",
             id = session.id,
             msgs = session.message_count,
+            model = model,
+            started = started,
             modified = session.modified_epoch_secs,
+            last_prompt = last_prompt,
             path = session.path.display(),
         ));
     }
     Ok(lines.join("\n"))
+}
+
+fn current_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn current_timestamp_rfc3339ish() -> String {
+    format!("{}Z", current_epoch_secs())
+}
+
+fn last_prompt_from_session(session: &Session) -> Option<String> {
+    session
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == MessageRole::User)
+        .and_then(|message| {
+            message.blocks.iter().find_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.trim().to_string()),
+                _ => None,
+            })
+        })
+        .filter(|text| !text.is_empty())
+}
+
+fn derive_session_metadata(session: &Session, model: &str) -> SessionMetadata {
+    let started_at = session
+        .metadata
+        .as_ref()
+        .map_or_else(current_timestamp_rfc3339ish, |metadata| {
+            metadata.started_at.clone()
+        });
+    SessionMetadata {
+        started_at,
+        model: model.to_string(),
+        message_count: session.messages.len().try_into().unwrap_or(u32::MAX),
+        last_prompt: last_prompt_from_session(session),
+    }
+}
+
+fn session_age_secs(modified_epoch_secs: u64) -> u64 {
+    current_epoch_secs().saturating_sub(modified_epoch_secs)
+}
+
+fn auto_compact_inactive_sessions(
+    active_session_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for summary in list_managed_sessions()? {
+        if summary.id == active_session_id
+            || session_age_secs(summary.modified_epoch_secs) < OLD_SESSION_COMPACTION_AGE_SECS
+        {
+            continue;
+        }
+        let path = summary.path.clone();
+        let Ok(session) = Session::load_from_path(&path) else {
+            continue;
+        };
+        if !runtime::should_compact(&session, CompactionConfig::default()) {
+            continue;
+        }
+        let mut compacted =
+            runtime::compact_session(&session, CompactionConfig::default()).compacted_session;
+        let model = compacted.metadata.as_ref().map_or_else(
+            || DEFAULT_MODEL.to_string(),
+            |metadata| metadata.model.clone(),
+        );
+        compacted.metadata = Some(derive_session_metadata(&compacted, &model));
+        compacted.save_to_path(&path)?;
+    }
+    Ok(())
 }
 
 fn render_repl_help() -> String {
@@ -1956,13 +2060,12 @@ fn build_runtime(
     enable_tools: bool,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
-    color: bool,
 ) -> Result<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
 {
     Ok(ConversationRuntime::new(
         session,
-        AnthropicRuntimeClient::new(model, enable_tools, allowed_tools.clone(), color)?,
-        CliToolExecutor::new(allowed_tools, color),
+        AnthropicRuntimeClient::new(model, enable_tools, allowed_tools.clone())?,
+        CliToolExecutor::new(allowed_tools),
         permission_policy(permission_mode),
         system_prompt,
     ))
@@ -2020,7 +2123,6 @@ struct AnthropicRuntimeClient {
     model: String,
     enable_tools: bool,
     allowed_tools: Option<AllowedToolSet>,
-    color: bool,
 }
 
 impl AnthropicRuntimeClient {
@@ -2028,7 +2130,6 @@ impl AnthropicRuntimeClient {
         model: String,
         enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
-        color: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
@@ -2036,7 +2137,6 @@ impl AnthropicRuntimeClient {
             model,
             enable_tools,
             allowed_tools,
-            color,
         })
     }
 }
@@ -2073,7 +2173,6 @@ impl ApiClient for AnthropicRuntimeClient {
             stream: true,
         };
 
-        let renderer = TerminalRenderer::with_color(self.color);
         self.runtime.block_on(async {
             let mut stream = self
                 .client
@@ -2093,18 +2192,11 @@ impl ApiClient for AnthropicRuntimeClient {
                 match event {
                     ApiStreamEvent::MessageStart(start) => {
                         for block in start.message.content {
-                            push_output_block(
-                                &TerminalRenderer::with_color(true),
-                                block,
-                                &mut stdout,
-                                &mut events,
-                                &mut pending_tool,
-                            )?;
+                            push_output_block(block, &mut stdout, &mut events, &mut pending_tool)?;
                         }
                     }
                     ApiStreamEvent::ContentBlockStart(start) => {
                         push_output_block(
-                            &renderer,
                             start.content_block,
                             &mut stdout,
                             &mut events,
@@ -2170,7 +2262,7 @@ impl ApiClient for AnthropicRuntimeClient {
                 })
                 .await
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
-            response_to_events(&renderer, response, &mut stdout)
+            response_to_events(response, &mut stdout)
         })
     }
 }
@@ -2182,29 +2274,19 @@ fn slash_command_completion_candidates() -> Vec<String> {
         .collect()
 }
 
-fn format_tool_call_start(renderer: &TerminalRenderer, name: &str, input: &str) -> String {
+fn format_tool_call_start(name: &str, input: &str) -> String {
     format!(
-        "{} {} {} {}",
-        renderer.warning("Tool call:"),
-        renderer.info(name),
-        renderer.warning("args="),
+        "Tool call
+  Name             {name}
+  Input            {}",
         summarize_tool_payload(input)
     )
 }
 
-fn format_tool_result(
-    renderer: &TerminalRenderer,
-    name: &str,
-    output: &str,
-    is_error: bool,
-) -> String {
-    let status = if is_error {
-        renderer.error("error")
-    } else {
-        renderer.success("ok")
-    };
+fn format_tool_result(name: &str, output: &str, is_error: bool) -> String {
+    let status = if is_error { "error" } else { "ok" };
     format!(
-        "### {} {}
+        "### Tool `{name}`
 
 - Status: {status}
 - Output:
@@ -2213,8 +2295,6 @@ fn format_tool_result(
 {}
 ```
 ",
-        renderer.warning("Tool"),
-        renderer.info(format!("`{name}`")),
         prettify_tool_payload(output)
     )
 }
@@ -2245,7 +2325,6 @@ fn truncate_for_summary(value: &str, limit: usize) -> String {
 }
 
 fn push_output_block(
-    renderer: &TerminalRenderer,
     block: OutputContentBlock,
     out: &mut impl Write,
     events: &mut Vec<AssistantEvent>,
@@ -2265,7 +2344,7 @@ fn push_output_block(
                 out,
                 "
 {}",
-                format_tool_call_start(renderer, &name, &input.to_string())
+                format_tool_call_start(&name, &input.to_string())
             )
             .and_then(|()| out.flush())
             .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -2276,7 +2355,6 @@ fn push_output_block(
 }
 
 fn response_to_events(
-    renderer: &TerminalRenderer,
     response: MessageResponse,
     out: &mut impl Write,
 ) -> Result<Vec<AssistantEvent>, RuntimeError> {
@@ -2284,7 +2362,7 @@ fn response_to_events(
     let mut pending_tool = None;
 
     for block in response.content {
-        push_output_block(renderer, block, out, &mut events, &mut pending_tool)?;
+        push_output_block(block, out, &mut events, &mut pending_tool)?;
         if let Some((id, name, input)) = pending_tool.take() {
             events.push(AssistantEvent::ToolUse { id, name, input });
         }
@@ -2306,9 +2384,9 @@ struct CliToolExecutor {
 }
 
 impl CliToolExecutor {
-    fn new(allowed_tools: Option<AllowedToolSet>, color: bool) -> Self {
+    fn new(allowed_tools: Option<AllowedToolSet>) -> Self {
         Self {
-            renderer: TerminalRenderer::with_color(color),
+            renderer: TerminalRenderer::new(),
             allowed_tools,
         }
     }
@@ -2329,14 +2407,14 @@ impl ToolExecutor for CliToolExecutor {
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
         match execute_tool(tool_name, &value) {
             Ok(output) => {
-                let markdown = format_tool_result(&self.renderer, tool_name, &output, false);
+                let markdown = format_tool_result(tool_name, &output, false);
                 self.renderer
                     .stream_markdown(&markdown, &mut io::stdout())
                     .map_err(|error| ToolError::new(error.to_string()))?;
                 Ok(output)
             }
             Err(error) => {
-                let markdown = format_tool_result(&self.renderer, tool_name, &error, true);
+                let markdown = format_tool_result(tool_name, &error, true);
                 self.renderer
                     .stream_markdown(&markdown, &mut io::stdout())
                     .map_err(|stream_error| ToolError::new(stream_error.to_string()))?;
@@ -2422,7 +2500,6 @@ fn print_help() {
     println!("  --output-format FORMAT     Non-interactive output format: text or json");
     println!("  --permission-mode MODE     Set read-only, workspace-write, or danger-full-access");
     println!("  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)");
-    println!("  --no-color                 Disable ANSI color output");
     println!("  --version, -V              Print version and build information locally");
     println!();
     println!("Interactive slash commands:");
@@ -2446,90 +2523,74 @@ fn print_help() {
 }
 
 #[cfg(test)]
-fn print_help_text_for_test() -> String {
-    use std::fmt::Write as _;
-
-    let mut output = String::new();
-    let _ = writeln!(
-        output,
-        "rusty-claude-cli v{VERSION}
-"
-    );
-    let _ = writeln!(output, "Usage:");
-    let _ = writeln!(
-        output,
-        "  rusty-claude-cli [--model MODEL] [--allowedTools TOOL[,TOOL...]]"
-    );
-    let _ = writeln!(output, "      Start the interactive REPL");
-    let _ = writeln!(
-        output,
-        "  rusty-claude-cli [--model MODEL] [--output-format text|json] prompt TEXT"
-    );
-    let _ = writeln!(output, "      Send one prompt and exit");
-    let _ = writeln!(
-        output,
-        "  rusty-claude-cli [--model MODEL] [--output-format text|json] TEXT"
-    );
-    let _ = writeln!(output, "      Shorthand non-interactive prompt mode");
-    let _ = writeln!(
-        output,
-        "  rusty-claude-cli --resume SESSION.json [/status] [/compact] [...]"
-    );
-    let _ = writeln!(
-        output,
-        "      Inspect or maintain a saved session without entering the REPL"
-    );
-    let _ = writeln!(output, "  rusty-claude-cli dump-manifests");
-    let _ = writeln!(output, "  rusty-claude-cli bootstrap-plan");
-    let _ = writeln!(
-        output,
-        "  rusty-claude-cli system-prompt [--cwd PATH] [--date YYYY-MM-DD]"
-    );
-    let _ = writeln!(output, "  rusty-claude-cli login");
-    let _ = writeln!(
-        output,
-        "  rusty-claude-cli logout
-"
-    );
-    let _ = writeln!(output, "Flags:");
-    let _ = writeln!(
-        output,
-        "  --model MODEL              Override the active model"
-    );
-    let _ = writeln!(
-        output,
-        "  --output-format FORMAT     Non-interactive output format: text or json"
-    );
-    let _ = writeln!(
-        output,
-        "  --permission-mode MODE     Set read-only, workspace-write, or danger-full-access"
-    );
-    let _ = writeln!(output, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)");
-    let _ = writeln!(
-        output,
-        "  --no-color                 Disable ANSI color output"
-    );
-    let _ = writeln!(
-        output,
-        "  --version, -V              Print version and build information locally"
-    );
-    output
-}
-
-#[cfg(test)]
 mod tests {
     use super::{
-        filter_tool_specs, format_compact_report, format_cost_report, format_init_report,
-        format_model_report, format_model_switch_report, format_permissions_report,
-        format_permissions_switch_report, format_resume_report, format_status_report,
-        format_tool_call_start, format_tool_result, normalize_permission_mode, parse_args,
-        parse_git_status_metadata, render_config_report, render_init_claude_md,
-        render_memory_report, render_repl_help, resume_supported_slash_commands, status_context,
-        CliAction, CliOutputFormat, SlashCommand, StatusUsage, DEFAULT_MODEL,
+        derive_session_metadata, filter_tool_specs, format_compact_report, format_cost_report,
+        format_init_report, format_model_report, format_model_switch_report,
+        format_permissions_report, format_permissions_switch_report, format_resume_report,
+        format_status_report, format_tool_call_start, format_tool_result, list_managed_sessions,
+        normalize_permission_mode, parse_args, parse_git_status_metadata, render_config_report,
+        render_init_claude_md, render_memory_report, render_repl_help,
+        resume_supported_slash_commands, sessions_dir, status_context, CliAction, CliOutputFormat,
+        SlashCommand, StatusUsage, DEFAULT_MODEL,
     };
-    use crate::{print_help_text_for_test, render::TerminalRenderer};
-    use runtime::{ContentBlock, ConversationMessage, MessageRole, PermissionMode};
+    use runtime::{ContentBlock, ConversationMessage, MessageRole, PermissionMode, Session};
+    use std::fs;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn derive_session_metadata_recomputes_prompt_and_count() {
+        let mut session = Session::new();
+        session
+            .messages
+            .push(ConversationMessage::user_text("first prompt"));
+        session
+            .messages
+            .push(ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "reply".to_string(),
+            }]));
+        let metadata = derive_session_metadata(&session, "claude-test");
+        assert_eq!(metadata.model, "claude-test");
+        assert_eq!(metadata.message_count, 2);
+        assert_eq!(metadata.last_prompt.as_deref(), Some("first prompt"));
+        assert!(metadata.started_at.ends_with('Z'));
+    }
+
+    #[test]
+    fn managed_sessions_use_home_directory_and_list_metadata() {
+        let temp =
+            std::env::temp_dir().join(format!("rusty-claude-cli-home-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).expect("temp home should exist");
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &temp);
+
+        let dir = sessions_dir().expect("sessions dir");
+        assert_eq!(dir, temp.join(".claude").join("sessions"));
+
+        let mut session = Session::new();
+        session
+            .messages
+            .push(ConversationMessage::user_text("persist me"));
+        session.metadata = Some(derive_session_metadata(&session, "claude-home"));
+        let file = dir.join("session-test.json");
+        session.save_to_path(&file).expect("session save");
+
+        let listed = list_managed_sessions().expect("session list");
+        let found = listed
+            .into_iter()
+            .find(|entry| entry.id == "session-test")
+            .expect("saved session should be listed");
+        assert_eq!(found.message_count, 1);
+        assert_eq!(found.model.as_deref(), Some("claude-home"));
+        assert_eq!(found.last_prompt.as_deref(), Some("persist me"));
+
+        fs::remove_file(file).ok();
+        if let Some(previous_home) = previous_home {
+            std::env::set_var("HOME", previous_home);
+        }
+        fs::remove_dir_all(temp).ok();
+    }
 
     #[test]
     fn defaults_to_repl_when_no_args() {
@@ -2539,7 +2600,6 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::WorkspaceWrite,
-                color: true,
             }
         );
     }
@@ -2559,7 +2619,6 @@ mod tests {
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::WorkspaceWrite,
-                color: true,
             }
         );
     }
@@ -2581,27 +2640,6 @@ mod tests {
                 output_format: CliOutputFormat::Json,
                 allowed_tools: None,
                 permission_mode: PermissionMode::WorkspaceWrite,
-                color: true,
-            }
-        );
-    }
-
-    #[test]
-    fn parses_no_color_flag() {
-        let args = vec![
-            "--no-color".to_string(),
-            "prompt".to_string(),
-            "hello".to_string(),
-        ];
-        assert_eq!(
-            parse_args(&args).expect("args should parse"),
-            CliAction::Prompt {
-                prompt: "hello".to_string(),
-                model: DEFAULT_MODEL.to_string(),
-                output_format: CliOutputFormat::Text,
-                allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
-                color: false,
             }
         );
     }
@@ -2627,7 +2665,6 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::ReadOnly,
-                color: true,
             }
         );
     }
@@ -2650,7 +2687,6 @@ mod tests {
                         .collect()
                 ),
                 permission_mode: PermissionMode::WorkspaceWrite,
-                color: true,
             }
         );
     }
@@ -2761,7 +2797,8 @@ mod tests {
         assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
-        assert!(help.contains("/resume <session-path>"));
+        assert!(help.contains("/resume <session-id-or-path>"));
+        assert!(help.contains("/sessions"));
         assert!(help.contains("/config [env|hooks|model]"));
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
@@ -3047,21 +3084,17 @@ mod tests {
         let help = render_repl_help();
         assert!(help.contains("Up/Down"));
         assert!(help.contains("Tab"));
-        assert!(print_help_text_for_test().contains("--no-color"));
         assert!(help.contains("Shift+Enter/Ctrl+J"));
     }
 
     #[test]
     fn tool_rendering_helpers_compact_output() {
-        let renderer = TerminalRenderer::with_color(false);
-        let start = format_tool_call_start(&renderer, "read_file", r#"{"path":"src/main.rs"}"#);
-        assert!(start.contains("Tool call:"));
-        assert!(start.contains("read_file"));
+        let start = format_tool_call_start("read_file", r#"{"path":"src/main.rs"}"#);
+        assert!(start.contains("Tool call"));
         assert!(start.contains("src/main.rs"));
 
-        let done = format_tool_result(&renderer, "read_file", r#"{"contents":"hello"}"#, false);
-        assert!(done.contains("Tool"));
-        assert!(done.contains("`read_file`"));
+        let done = format_tool_result("read_file", r#"{"contents":"hello"}"#, false);
+        assert!(done.contains("Tool `read_file`"));
         assert!(done.contains("contents"));
     }
 }

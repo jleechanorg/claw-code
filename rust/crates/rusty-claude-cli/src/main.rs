@@ -319,7 +319,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 index += 1;
             }
             "--dangerously-skip-permissions" => {
-                permission_mode_override = Some(PermissionMode::DangerFullAccess);
+                permission_mode_override = Some(PermissionMode::Allow);
                 index += 1;
             }
             "-p" => {

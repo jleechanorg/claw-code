@@ -189,6 +189,11 @@ impl PermissionPolicy {
         }
 
         let current_mode = self.active_mode();
+
+        // Allow mode (--dangerously-skip-permissions) bypasses all prompting.
+        if current_mode == PermissionMode::Allow {
+            return PermissionOutcome::Allow;
+        }
         let required_mode = self.required_mode_for(tool_name);
         let ask_rule = Self::find_matching_rule(&self.ask_rules, tool_name, input);
         let allow_rule = Self::find_matching_rule(&self.allow_rules, tool_name, input);
@@ -679,5 +684,40 @@ mod tests {
             prompter.seen[0].reason.as_deref(),
             Some("hook requested confirmation")
         );
+    }
+
+    #[test]
+    fn allow_mode_never_prompts_even_with_ask_rules_and_hook_ask() {
+        let rules = RuntimePermissionRuleConfig::new(
+            Vec::new(),
+            Vec::new(),
+            vec!["bash(git:*)".to_string()],
+        );
+        let policy = PermissionPolicy::new(PermissionMode::Allow)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess)
+            .with_permission_rules(&rules);
+        let context = PermissionContext::new(
+            Some(PermissionOverride::Ask),
+            Some("hook requested confirmation".to_string()),
+        );
+        let mut prompter = RecordingPrompter {
+            seen: Vec::new(),
+            allow: false, // would deny if called
+        };
+
+        // Ask rule
+        let outcome = policy.authorize("bash", r#"{"command":"git status"}"#, Some(&mut prompter));
+        assert_eq!(outcome, PermissionOutcome::Allow);
+        assert_eq!(prompter.seen.len(), 0, "prompter must not be called in Allow mode");
+
+        // Hook Ask override
+        let outcome = policy.authorize_with_context(
+            "bash",
+            "{}",
+            &context,
+            Some(&mut prompter),
+        );
+        assert_eq!(outcome, PermissionOutcome::Allow);
+        assert_eq!(prompter.seen.len(), 0, "prompter must not be called in Allow mode");
     }
 }
